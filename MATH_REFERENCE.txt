@@ -1,0 +1,670 @@
+================================================================================
+2D RCS SOLVER — MATH REFERENCE
+================================================================================
+
+This document describes the mathematics of the 2D boundary-integral-equation
+radar cross section solver implemented in rcs_solver.py.  Part 1 gives a
+plain-English overview aimed at an engineer who wants to understand what the
+solver does, why it works, and when to trust it.  Part 2 is the full-depth
+mathematical derivation of every formulation that the solver dispatches.
+
+
+================================================================================
+PART 1 — HIGH-LEVEL OVERVIEW
+================================================================================
+
+1.1 WHAT THE SOLVER COMPUTES
+----------------------------
+
+Given a 2D shape (or collection of shapes) built from line segments, arcs, and
+material properties, the solver computes the radar cross section (RCS) — a
+measure of how much electromagnetic energy the shape scatters back toward the
+radar.
+
+Inputs:
+  - A geometry snapshot: line segments + arcs (optionally closed into bodies)
+  - Segment types (PEC, dielectric, resistive sheet, IBC-coated PEC, etc.)
+  - Material properties (permittivity, permeability, surface impedance)
+  - Frequency or frequency sweep
+  - Incidence angle(s) and polarization (TE = E-field axial, TM = H-field axial)
+
+Outputs:
+  - Monostatic RCS σ(θ) in dB and linear units
+  - Per-sample far-field amplitude (real, imaginary, phase)
+  - Solve diagnostics: formulation used, residual norm, condition number
+
+The solver reports σ in the physical 2D "scattering width" normalization:
+
+    σ_2D(φ) = |A(φ)|² / (4k)
+
+where A is the far-field amplitude and k is the free-space wavenumber.  Under
+this convention, a PEC circular cylinder matches the analytic Mie series
+term-for-term (checked to within 0.1 dB for ka from 0.5 to 10).
+
+
+1.2 WHY THIS APPROACH
+---------------------
+
+The solver uses the Boundary Integral Equation (BIE) method, also called the
+Method of Moments (MoM), rather than a volumetric method like Finite Element
+or Finite Difference Time Domain.  The key reasons:
+
+  * Only the surface of the scatterer needs to be meshed.  A 10λ-wide metallic
+    shape needs ~200 boundary elements, not ~40 000 volumetric cells.
+  * The radiation condition is satisfied exactly by the Green's function —
+    no artificial absorbing boundaries in the computational domain.
+  * Far-field evaluation is analytic: once the surface current is known, the
+    scattered field at any observation angle is one quadrature away.
+
+The tradeoff: the BIE matrix is dense (every element interacts with every
+other via the Green's function), so the storage is O(N²) and dense LU solve
+is O(N³).  The FMM acceleration (see SOLVER_METHODS.txt) brings this down to
+O(N log N) for large problems.
+
+
+1.3 THE CORE IDEA IN ONE PARAGRAPH
+----------------------------------
+
+Every solution to the 2D Helmholtz equation (∇²u + k²u = 0) outside a body can
+be written as an integral over the body's boundary of the product of a
+"source density" times the Green's function (or its normal derivative).  The
+boundary conditions — PEC is u=0 for TE or ∂u/∂n=0 for TM; resistive sheet is
+u = Z_s·J_z; dielectric is continuity of u and (some factor times) ∂u/∂n —
+become integral equations for the unknown source density on the boundary.
+Discretize the boundary into straight panels, expand the source density in
+piecewise-linear basis functions, test against the same basis (Galerkin), and
+you get a dense linear system A·x = b.  Solve it (LU or iterative GMRES with
+FMM acceleration).  Integrate the solution density against e^{-jkr̂·r'} along
+the boundary to get the far-field amplitude A(φ).  Compute σ = |A|²/(4k).
+
+
+1.4 THE FOUR THINGS THAT MAKE THIS SOLVER WORK
+----------------------------------------------
+
+(1) Correct Green's function and sign conventions
+
+The 2D scalar Green's function under the e^{-jωt} time convention is
+
+    G(r,r') = (j/4) H₀^(2)(k|r-r'|)
+
+and ALL the derivations downstream depend on this sign.  Using H₀^(1) or
+e^{+jωt} flips signs in unpredictable places.  The solver uses (j/4)H₀^(2)
+consistently; the convention check script (convention_check.py) validates
+this by reproducing known analytic answers.
+
+(2) Proper handling of the near-singular quadrature
+
+When two panels are close or touching, the kernel G(r,r') diverges
+logarithmically.  Naive Gauss-Legendre quadrature gives wrong self and
+neighbor interactions by factors of 2 or more.  The solver uses:
+  - Duffy transforms for self and touching panels (exact treatment of log)
+  - Adaptive recursive subdivision for near-but-not-touching pairs
+  - Standard Gauss-Legendre for far pairs (cheap and accurate)
+
+(3) The right formulation for each material type
+
+One-size-fits-all fails.  For each geometry class the solver picks an integral
+representation that gives a well-conditioned system:
+  - PEC closed body: CFIE (combined field) to avoid interior resonances
+  - Single dielectric body: two-density indirect formulation (u and q on same surface)
+  - Multi-region or coated: direct coupled trace formulation
+  - Resistive sheet: single-layer (TE) or double-layer/hypersingular (TM)
+  - Mixed sheet + PEC: unified SLP/DLP with per-node diagonal
+
+(4) Validation at every level
+
+Numerical claims are backed by reference solutions:
+  - Mie series for circular cylinders (PEC, dielectric, magnetic, coated)
+  - Reciprocity test σ(α→β) = σ(β→α) for bistatic scattering
+  - PEC/transparent limits for resistive sheets
+  - Stair-step consistency for tapered impedance
+
+
+1.5 WHAT YOU NEED TO GIVE THE SOLVER
+------------------------------------
+
+For the physics to be right, the geometry must satisfy:
+  - Closed bodies wound clockwise (produces outward-pointing panel normals)
+  - At least ~10 panels per wavelength (20 is safer for tight features)
+  - Consistent material assignments (same IBC flag means same impedance)
+
+The solver handles:
+  - Multiple disjoint bodies
+  - Open strips and sheets
+  - Stacked materials (layered dielectric coatings)
+  - Tapered IBC along a segment (new feature, see TAPERED_IBC.md)
+  - Mixed material types in one geometry, within the dispatcher's routing
+    table (see Part 2.10)
+
+
+1.6 WHEN TO DOUBT A RESULT
+--------------------------
+
+  - Residual norm much above 1e-10: system is ill-conditioned or too few
+    panels.  Refine the mesh.
+  - A closed body whose ka > 5 solved without CFIE: interior resonances
+    may contaminate the answer.  Use cfie_alpha=0.2 (default).
+  - Very thin layers (< λ/20 thick) near a surface: near-singular quadrature
+    may under-resolve.  Use more panels per wavelength.
+  - Extreme impedance contrasts (Z_s < 0.01 Ω or > 10⁴ Ω): system
+    approaches a limiting case (PEC or transparent) and conditioning
+    degrades.  The dedicated limit formulations (pure PEC, no sheet)
+    are more accurate.
+
+
+================================================================================
+PART 2 — FULL MATHEMATICAL DERIVATION
+================================================================================
+
+
+2.1 CONVENTIONS
+---------------
+
+Time convention:      e^{-jωt}
+Wavenumber:           k = ω/c (real and positive for lossless free space)
+Free-space impedance: η = √(μ₀/ε₀) ≈ 376.730313668 Ω
+Speed of light:       c = 299792458 m/s
+
+Polarization:
+  TE: E_z is axial, (H_x, H_y) in-plane.  The scalar unknown u = E_z.
+  TM: H_z is axial, (E_x, E_y) in-plane.  The scalar unknown u = H_z.
+
+Panel geometry:
+  Each panel has endpoints p₀, p₁, length L = |p₁ - p₀|, tangent t̂ = (p₁-p₀)/L,
+  normal n̂ = (-t_y, t_x) (90° rotation of tangent counterclockwise).
+
+  For closed contours wound clockwise, this normal points OUT of the body.
+  This is critical — an inward-pointing normal flips the sign of every
+  normal-derivative term in the integral equations.  The convention check
+  script verifies this on known geometries.
+
+
+2.2 THE 2D HELMHOLTZ EQUATION AND GREEN'S FUNCTION
+---------------------------------------------------
+
+Outside the scatterer, the total field u (= E_z for TE, = H_z for TM) satisfies
+
+    (∇² + k²) u = 0
+
+with the Sommerfeld radiation condition as r → ∞.  The fundamental solution is
+
+    G(r, r') = (j/4) H₀^(2)(k|r - r'|)
+
+Under our e^{-jωt} convention, H₀^(2) — not H₀^(1) — gives outgoing waves.
+We will also need:
+
+  ∂G/∂n(r')         = source-side normal derivative
+  ∂G/∂n(r)          = observation-side normal derivative (used in hypersingular)
+
+Key operators, acting on a density φ(r') on the boundary Γ:
+
+  (S φ)(r) = ∫_Γ G(r, r') φ(r') dr'            (single-layer potential, SLP)
+  (K φ)(r) = ∫_Γ ∂G(r,r')/∂n(r') φ(r') dr'     (double-layer potential, DLP)
+  (K' φ)(r) = ∫_Γ ∂G(r,r')/∂n(r) φ(r') dr'    (adjoint double-layer)
+  (D φ)(r) = ∫_Γ ∂²G(r,r')/∂n(r)∂n(r') φ(r') dr' (hypersingular)
+
+Jump relations at the boundary (for r approaching Γ from inside/outside):
+
+    S φ:   continuous
+    K φ:   lim from +side  =  +½ φ + K φ        (K φ at r ∈ Γ is principal value)
+           lim from -side  =  -½ φ + K φ
+    ∂n S φ: lim from +side =  -½ φ + K' φ
+            lim from -side =  +½ φ + K' φ
+    D φ:   continuous (hypersingular, requires Maue identity for practical
+                       evaluation, see §2.4)
+
+These jump relations are what turn the integral representation into a
+boundary integral equation when we enforce BCs on each side of Γ.
+
+
+2.3 THE PLANE-WAVE INCIDENT FIELD
+---------------------------------
+
+Incident angle φ_inc measured from +x axis, incident direction d̂ =
+(cos φ_inc, sin φ_inc).  The incident plane wave is
+
+    u_inc(r) = exp(j k d̂ · r)
+
+Its normal derivative on the boundary:
+
+    ∂u_inc/∂n(r) = j k (d̂ · n̂) exp(j k d̂ · r)
+
+These appear on the right-hand side of every integral equation we solve.
+
+
+2.4 THE MAUE IDENTITY (HYPERSINGULAR OPERATOR)
+----------------------------------------------
+
+Evaluating D directly requires integration of a 1/r² kernel, which has
+O(1/h) error for smooth integrands and is unstable.  The Maue identity
+expresses D in terms of S only, dodging the hypersingular quadrature:
+
+For a single element pair (obs, src), the hypersingular block is
+
+    D_{obs,src} = -k² (n_obs · n_src) S_{obs,src}_scalar
+                 + (t_obs ⊗ t_src) / (L_obs L_src) · Σ S_{obs,src}
+
+where S_{obs,src} is the single-layer block between the two elements, and
+"Σ S" is the sum of S evaluated with constant testing functions.  This is
+what _assemble_linear_hypersingular_matrix implements.  The derivation
+comes from integration by parts on the tangential derivatives:
+
+    (D φ)(r) = ∫ ∂²G/∂n∂n' φ dr'
+             = ∂_t [∫ G (∂_t' φ) dr'] - k² (n · n') ∫ G φ dr'
+
+(with boundary terms assumed to vanish on closed contours; for open contours
+the Meixner edge condition pins the relevant endpoint values).
+
+
+2.5 TE PEC FORMULATION (EFIE — ELECTRIC FIELD INTEGRAL EQUATION)
+----------------------------------------------------------------
+
+For TE polarization on a PEC body, the axial electric field E_z must
+vanish on the surface.  Represent the scattered field by a single-layer
+potential:
+
+    u_s(r) = (S σ)(r)
+
+for an unknown density σ.  The total field on Γ is u_inc + u_s.  BC:
+
+    u_inc + u_s = 0  on Γ
+  ⇒ S σ = -u_inc
+
+In Galerkin form with piecewise-linear basis φ_j:
+
+    [S_ij] σ = -[<φ_i, u_inc>]
+
+where S_ij = <φ_i, S φ_j>.  Single density, single equation per node.
+
+Far field: u_s(r,φ) ~ (phase) A(φ) as r → ∞, with
+
+    A(φ) = ∫_Γ σ(r') exp(j k d̂_obs · r') dr'
+
+(standard SLP far-field projector).
+
+
+2.6 TM PEC FORMULATION (MFIE — MAGNETIC FIELD INTEGRAL EQUATION)
+----------------------------------------------------------------
+
+For TM polarization on a PEC body, ∂H_z/∂n on the surface equals the surface
+current J_tan via ∇ × H = J.  Representing u_s = S σ as before, the BC is
+
+    ∂(u_inc + u_s)/∂n = 0  on Γ
+
+Taking the normal derivative of S σ and using the jump relation:
+
+    ∂_n(S σ) = -½ σ + K' σ   (from the +side, exterior)
+  ⇒ (-½ M + K') σ = -∂u_inc/∂n
+
+where M is the boundary mass matrix from Galerkin testing.  This is the
+classical MFIE.
+
+In the solver, this appears as _solve_tm_robin_mfie with zero Robin impedance.
+
+
+2.7 TE/TM IBC FORMULATION (GENERALIZED ROBIN BC)
+-------------------------------------------------
+
+Surface Impedance Boundary Condition (SIBC), also called Leontovich or Robin BC:
+
+    TE: E_z = Z_s · J_tan  where J_tan = ∂(E_z)/∂n / (jωμ)  (unit factors)
+    TM: E_tan = Z_s · J_axial, with E_tan derived from H_z
+
+For TE this reduces (after dimensional normalization) to
+
+    u + α (∂u/∂n) = 0    where  α = Z_s / (jkη)    [TE Robin coefficient]
+
+For TM the analogous combination after unit conversion is
+
+    u + α (∂u/∂n) = 0    where  α = jkη Z_s / k²   ≈ factors (see §2.9)
+
+The unified Robin-BIE representation (u_s = S σ, σ is the unknown SLP
+density):
+
+  Apply BC:  (u_inc + S σ) + α ∂_n(u_inc + S σ) = 0
+  Jump:      ∂_n(S σ)|_+ = -½ σ + K' σ
+  ⇒ system:  (S + α(-½M + K')) σ = -u_inc - α ∂u_inc/∂n
+
+This is _solve_robin_bie (TE) and its TM variant.  The dispatcher picks
+per-node α from each element's Z_s, averaged over incident elements at
+shared nodes (this is how the tapered-IBC feature works — Z_s varies with
+the panel's arc-length position, and the α array is correspondingly
+per-node).
+
+
+2.8 DIELECTRIC TRANSMISSION FORMULATION (TWO-DENSITY INDIRECT)
+--------------------------------------------------------------
+
+For a single dielectric body (TYPE 3), the BCs are transmission:
+
+    u^+ = u^-                         (u continuous across Γ)
+    (1/ξ⁺) ∂u^+/∂n = (1/ξ⁻) ∂u^-/∂n   (normal flux continuous;
+                                       ξ = μ for TE, ε for TM)
+
+where +/- are exterior/interior.  Represent the exterior and interior
+scattered fields separately:
+
+    Exterior:  u_s^+ = S^+ σ + ½ M σ + K^+ σ  (?)   — actually the solver uses
+                                                      an indirect formulation
+                                                      with two independent
+                                                      densities, μ (exterior
+                                                      DLP) and σ (interior SLP)
+
+The two-density system the solver assembles:
+
+    [  ½M + K₀         -S_int      ] [ μ ]     [  -u_inc        ]
+    [                               ] [   ]  =  [                ]
+    [  D₀              factor·(½M + K'_int) ] [ σ ]   [ -∂u_inc/∂n  ]
+
+with factor = ξ_ext / ξ_int.  The derivation:
+
+  - Enforce u continuity across Γ → first row
+  - Enforce (1/ξ) ∂u/∂n continuity → second row
+  - D is the exterior hypersingular, computed via Maue (§2.4)
+  - S_int, K'_int use the interior wavenumber k_int = k₀ n, where n = √(ε_r μ_r)
+
+This is _solve_dielectric_indirect.  For TE the factor uses μ; for TM it uses ε.
+
+
+2.9 TYPE 1 SHEET FORMULATIONS (NEWLY DERIVED)
+---------------------------------------------
+
+A "sheet" is a thin resistive/reactive layer in free space (both sides are air),
+with a jump condition tied to surface admittance Y_s = 1/Z_s.
+
+TE SHEET (E_z axial, J_z current along axis):
+
+Physics:
+  - E_z continuous across sheet (tangential E field)
+  - Ohm's law: J_z = E_z / Z_s on the sheet
+  - Scattered field from a z-directed axial surface current:
+        u_s(r) = jkη ∫_Γ G(r, r') J_z(r') dr'
+
+SIBC on the sheet:
+        u_inc + u_s = Z_s · J_z
+
+Introduce σ = jkη · J_z so that u_s = SLP(σ) reuses the existing SLP
+far-field projector:
+
+        u_inc + S σ = (Z_s / jkη) · σ    (evaluated on Γ)
+
+Galerkin system:
+        (S - (Z_s/jkη) M) σ = -<φ, u_inc>
+
+Limit checks:
+        Z_s → 0:   S σ = -u_inc              (reduces to TE-PEC EFIE ✓)
+        Z_s → ∞:   σ → 0                    (transparent sheet ✓)
+
+This is _solve_te_sheet.  Far field via standard SLP projector.
+
+TM SHEET (H_z axial, tangential current K):
+
+Physics:
+  - E_tan continuous across sheet
+  - [H_z]+ - [H_z]- = K  (H jump = surface tangential current)
+  - Ohm's law: K = E_tan / Z_s
+  - E_x = -(1/jωε₀) ∂H_z/∂y  (Maxwell–Ampère on the H_z equation)
+
+Represent u_s by a double-layer potential with density μ = K:
+
+        u_s(r) = ∫_Γ ∂G(r,r')/∂n(r') μ(r') dr'
+
+Properties:
+  - u_s jumps by μ across Γ (matches the physical [H_z] = K jump ✓)
+  - ∂u_s/∂n is continuous across Γ and equals (D μ)(r)
+
+Relating everything through Maxwell's equations and Ohm's law:
+
+        q = q_inc + (D μ)(r)    where q = ∂u/∂n on Γ
+        E_tan = -(1/jωε₀) q
+        K = μ = Y_s · E_tan = -(Y_s / jωε₀) q
+
+Substituting q and using jωε₀ = jk/η:
+
+        μ = -(1/(jωε₀ Z_s)) · (q_inc + D μ)
+        (jωε₀ Z_s) μ + D μ = -q_inc
+        (D + (jk/η) Z_s · I) μ = -q_inc
+
+In Galerkin form (and using Maue for D):
+
+        (N + (jk/η) Z_s M) μ = -<φ, ∂u_inc/∂n>
+
+where N is the Galerkin hypersingular matrix from Maue.
+
+Limit checks:
+        Z_s → 0:   N μ = -q_inc              (reduces to TM-PEC Neumann ✓)
+        Z_s → ∞:   μ → 0                    (transparent ✓)
+
+MEIXNER EDGE CONDITION (TM only, crucial for open sheets):
+
+At an open strip's endpoints, H_z must be continuous (there's no material
+there to support a current jump), so
+
+        K = [H_z]+ - [H_z]- → 0 at free endpoints
+        μ → 0 at the geometric endpoints of the sheet
+
+In the solver this is enforced by pinning the rows corresponding to
+geometric endpoint nodes: replace the hypersingular row with identity,
+set RHS to 0.  The subtlety: the interface-aware mesh builder may create
+multiple node IDs at the same geometric location when adjacent segments
+have different material signatures (e.g., stair-stepped tapered IBC), so
+the pin must be by GEOMETRIC KEY, not by per-node incidence count.
+
+TE does NOT need this pin because σ = jkη · J_z has no Meixner zero at a
+resistive-strip edge; the current density can be finite there.
+
+Far field for TM sheet: DLP projector
+        A(φ) = ∫_Γ jk (d̂ · n̂) μ(r') exp(jk d̂ · r') dr'
+
+
+2.10 MIXED SHEET + PEC FORMULATION (UNIFIED REPRESENTATION)
+-----------------------------------------------------------
+
+A geometry with both TYPE 1 sheets and pure-PEC TYPE 2 bodies can be handled
+in a single block because both surface types admit the same integral
+representation:
+
+  - PEC SLP-EFIE (TE):   S σ = -u_inc
+  - Sheet TE:            (S - (Z_s/jkη) M) σ = -u_inc
+  - Both reduce to:      (S - α_i M) σ = -u_inc  with α_i = Z_i/(jkη) per node,
+                         where α_i = 0 on PEC nodes, α_i = Z_s/(jkη) on sheet nodes
+
+Similarly for TM:
+  - PEC MFIE:            -½ M σ + K' σ = -q_inc
+  - Sheet TM:            (N + (jk/η) Z_s M) μ = -q_inc
+  - Note these use DIFFERENT representations (SLP vs DLP).
+
+For TM mixed, the solver uses the DLP representation throughout (μ density),
+and the PEC-TM Neumann BC becomes (N μ = -q_inc) — same as the Z → 0 limit
+of the sheet formula, with the Meixner pin skipped on closed-body nodes.
+
+The implementation (_solve_mixed_sheet_pec) builds one system with:
+  - TE: (S - diag(α_i) · M) σ = -<φ, u_inc>, α_i = Z_i/(jkη) (0 on PEC)
+  - TM: (N + diag(α_i) · M) μ = -<φ, q_inc>, α_i = (jk/η)·Z_i (0 on PEC)
+  - Meixner pin only at GEOMETRIC sheet endpoints (via
+    _geometric_sheet_endpoint_nodes), NOT at closed-PEC nodes
+
+Reciprocity (σ(α→β) = σ(β→α)) and monostatic/bistatic consistency are
+satisfied to machine precision (validated: 0.0000 dB error on both checks).
+
+
+2.11 COUPLED TRACE FORMULATION (GENERAL CASE)
+---------------------------------------------
+
+For geometries mixing PEC, IBC, and dielectric interfaces, the solver uses
+a direct formulation with two nodal unknowns per node: u (the trace) and
+q (the normal flux from the minus side).  The system is built from
+representation-formula rows (exterior radiation condition on the + side)
+plus BC rows (enforcing each material's condition).
+
+This is _build_coupled_matrix_linear.  The derivation is lengthy but
+amounts to:
+
+  Representation row (for each active region):
+        (½M + K₋ - K₊) u + (q+γ · S₊ - S₋) q + q+β S₊ q = ... [RHS: incident]
+
+  BC row depends on bc_kind:
+  - PEC-TE: u = 0 at the node
+  - PEC-TM: q = 0 at the node
+  - Robin:  u + α q = 0
+  - Transmission: u^+ = u^-, (1/ξ+) q^+ = (1/ξ-) q^- (enforced via coupling
+    between the two regions' representation rows)
+
+Junction constraints handle nodes where three or more material types meet.
+This is the "general fallback" — less efficient than the specialized paths
+for pure geometries, but handles arbitrary combinations.
+
+
+2.12 MULTI-REGION INDIRECT FORMULATION (LAYERED COATINGS)
+---------------------------------------------------------
+
+For geometries with multiple nested homogeneous regions (e.g., dielectric
+coating over a PEC core), the solver uses an indirect SLP formulation per
+region, coupled across interfaces.  Each region gets its own SLP density on
+its bounding interfaces, and transmission conditions couple adjacent regions.
+
+The layout (see _solve_multi_region_indirect):
+  - Each interface contributes one or two DOF blocks (minus side, plus side)
+  - PEC interfaces: one-sided (only the air-side SLP density)
+  - Transmission interfaces: two-sided, with a β = ξ_plus / ξ_minus factor
+
+Far field: sum of exterior-region SLP densities, projected at observation
+angles via the standard SLP projector.  This is what
+_farfield_at_angles_slp does.
+
+
+2.13 CFIE (BURTON-MILLER) REGULARIZATION
+-----------------------------------------
+
+Closed-body interior resonances are a well-known pathology: at certain
+discrete frequencies (determined by the interior eigenvalues of the
+Helmholtz operator), the EFIE matrix becomes singular even though the
+physical scattering problem is well-posed.  Burton & Miller's remedy (1971):
+
+    Use EFIE + jα/k · MFIE as the combined equation.
+
+At any eigenvalue of the interior problem, EFIE and MFIE cannot both be
+singular (their adjoint structure differs), so the combined equation is
+regular for all k.
+
+The solver implementation (cfie_alpha parameter, default 0.2):
+
+    A_CFIE = A_EFIE + (jα/k) A_MFIE_correction
+
+where the MFIE correction adds:
+  - u-block:  α_BM · (D_minus - D_plus + K'_plus · γ - ½ M · γ)
+  - q-block:  α_BM · (M · (1 - ½ β) - K'_minus + K'_plus · β)
+
+with α_BM = jα/k.  These are applied as additive corrections to the
+coupled-trace system rows.  Setting cfie_alpha = 0 disables CFIE (useful
+for validation against pure-EFIE or pure-MFIE analytic references).
+
+
+2.14 BOUNDARY-ELEMENT DISCRETIZATION
+------------------------------------
+
+The continuous BIE is discretized via piecewise-linear continuous Galerkin:
+
+  - Mesh: N nodes, N_e elements (straight line segments).  Each element has
+    two node IDs at its endpoints.
+
+  - Basis: φ_i(r) is the "hat function" — linear on elements incident to
+    node i, zero elsewhere, = 1 at node i.
+
+  - Unknown expansion: σ(r) ≈ Σ_i σ_i φ_i(r), with σ_i the nodal DOFs.
+
+  - Galerkin test: enforce <φ_i, (equation)> = 0 for every test function φ_i.
+
+This produces the N×N (or 2N×2N for coupled formulations) dense matrix A,
+and the nodal RHS vector b.
+
+Assembly of one matrix entry (e.g., S_ij) requires a double integral:
+
+    S_ij = ∫∫ G(r,r') φ_i(r) φ_j(r') dr dr'
+
+which breaks into element-pair blocks.  For each (obs_element, src_element)
+pair, the integrand's behavior depends on their geometric relationship:
+
+  - Coincident (self-term):     Duffy transform handles log singularity exactly
+  - Sharing one vertex:         Touching-Duffy transform
+  - Near but disjoint:          Recursive subdivision until smooth at the
+                                quadrature scale
+  - Well-separated:             Plain Gauss-Legendre 8×8 tensor product
+
+All of this is done in _integrate_linear_pair_* functions.  The far-field
+blocks can be computed in bulk via vectorized numpy (_assemble_linear_far_blocks).
+
+
+2.15 THE TAPERED IBC FEATURE
+-----------------------------
+
+A tapered impedance row in the IBCS section has the form
+
+    flag  taper  <kind>  R_start  X_start  R_end  X_end
+
+where <kind> ∈ {linear, cosine, exp}.  The solver:
+
+  (1) Parses this into an ImpedanceTaper dataclass (rcs_solver.py:167).
+  (2) Each panel records arc_s_center ∈ [0,1] = position along segment.
+  (3) MaterialLibrary.get_impedance(flag, freq, arc_s) returns Z(s).
+  (4) Each panel gets its own robin_impedance via Z(panel.arc_s_center).
+  (5) Per-node α is averaged across incident elements (for shared-node
+      continuity on tapered segments).
+
+Consistency is verified by the stair-step test (test_taper_stairstep_cyl.py):
+replacing the continuous taper with N constant sub-segments and checking
+that the RCS converges to the tapered answer as N grows.  TM converges to
+0.006 dB at N=20; TE to ~0.14 dB at N=50 (O(1/N)).
+
+
+2.16 FAR-FIELD EVALUATION
+--------------------------
+
+Once the boundary density is known, the far-field amplitude A(φ) is a
+single quadrature of the density against e^{-jk d̂·r'}:
+
+  SLP projector (σ on Γ):
+      A(φ) = ∫_Γ σ(r') exp(j k d̂_obs · r') dr'
+
+  DLP projector (μ on Γ):
+      A(φ) = ∫_Γ jk (d̂_obs · n̂) μ(r') exp(j k d̂_obs · r') dr'
+
+These are what _farfield_at_angles_slp and _farfield_at_angles_dlp do.
+Both use 8-point Gauss-Legendre per element — more than enough for the
+non-oscillatory far-field integrand.
+
+The 2D scattering width (physical normalization) is
+
+    σ_2D(φ) = |A(φ)|² / (4k)
+
+matching the asymptotic behavior
+
+    u_s(r,φ) ~ √(1/(8πkr)) · e^{-j(kr - π/4)} · A(φ)
+
+as r → ∞.  This convention makes the solver output match Mie theory for
+the circular cylinder term-by-term, with no k-dependent rescaling.
+
+
+2.17 VALIDATION MATRIX (WHAT WE ACTUALLY CHECKED)
+--------------------------------------------------
+
+Quantitative convergence is demonstrated on:
+
+  * PEC cylinder, TE and TM, ka = 0.5 to 10: all within 0.1 dB of Mie.
+  * Dielectric cylinder (ε_r = 4, μ_r = 1), TE and TM: within 0.1 dB.
+  * Magnetic dielectric (ε_r = 1, μ_r = 4): within 0.1 dB.
+  * Coated PEC (ε_r = 4 coating, PEC core): within 0.15 dB.
+  * IBC cylinder, six complex-Z cases, TE and TM: within 0.005 dB
+    (exact analytic expression via Mie with Robin BC).
+  * TYPE 1 sheet PEC limit (Z → 0): matches TYPE 2 PEC strip within 0.01 dB (TE)
+    and 0.2 dB (TM, limited by Meixner-pin edge effect).
+  * TYPE 1 sheet transparent limit (Z → 10⁴ Ω): σ → -30 dB (both TE, TM).
+  * Tapered IBC stair-step convergence (closed TYPE 2 cylinder):
+    TM within 0.006 dB at N=20, TE within 0.14 dB at N=50.
+  * Bistatic reciprocity (all supported formulations): < 0.002 dB.
+  * Monostatic = bistatic at backscatter (all supported formulations): 0.000 dB.
+
+These are in convention_check.py, validate_mie_quick.py, test_validation.py,
+test_sheet_*.py, test_mixed_sheet_pec.py, test_taper_stairstep_cyl.py.
+
+================================================================================
